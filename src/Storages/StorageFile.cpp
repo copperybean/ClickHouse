@@ -209,6 +209,17 @@ StorageFile::StorageFile(const std::string & relative_table_dir_path, CommonArgu
     paths = {getTablePath(table_dir_path, format_name)};
 }
 
+StorageFile::StorageFile(const std::vector<std::string> & files, CommonArguments args)
+    : StorageFile(args)
+{
+    if (files.empty())
+        throw Exception("Storage " + getName() + " requires data path", ErrorCodes::INCORRECT_FILE_NAME);
+    if (args.format_name == "Distributed")
+        throw Exception("Distributed format is allowed only with explicit file path", ErrorCodes::INCORRECT_FILE_NAME);
+
+    paths = files;
+}
+
 StorageFile::StorageFile(CommonArguments args)
     : IStorage(args.table_id)
     , format_name(args.format_name)

@@ -83,6 +83,9 @@ protected:
     /// From table in database
     StorageFile(const std::string & relative_table_dir_path, CommonArguments args);
 
+    /// From table in database
+    StorageFile(const std::vector<std::string> & files, CommonArguments args);
+
 private:
     explicit StorageFile(CommonArguments args);
 

@@ -1,6 +1,6 @@
 set(CLICKHOUSE_SERVER_SOURCES
-    MetricsTransmitter.cpp
-    Server.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/MetricsTransmitter.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/Server.cpp
 )
 
 if (OS_LINUX)
@@ -63,5 +63,7 @@ if (OS_LINUX)
     # CMake can shuffle each of target_link_libraries arguments with other
     # libraries in linker command. To avoid this we hardcode whole-archive
     # library into single string.
-    add_dependencies(clickhouse-server-lib clickhouse_server_configs)
+    if(NOT CLICKHOUSE_ONE_SHARED)
+        add_dependencies(clickhouse-server-lib clickhouse_server_configs)
+    endif()
 endif ()

@@ -1,5 +1,11 @@
 cmake_minimum_required(VERSION 3.3)
 
+add_compile_options(-fPIC)
+include_directories("/usr/lib/jvm/java-8-openjdk-amd64/include")
+include_directories("/usr/lib/jvm/java-8-openjdk-amd64/include/linux")
+# add_compile_options(-dynamiclib)
+# add_compile_options(-framework JavaVM)
+
 foreach(policy
         CMP0023
         CMP0048 # CMake 3.0

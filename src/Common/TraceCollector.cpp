@@ -71,7 +71,7 @@ void TraceCollector::collect(TraceType trace_type, const StackTrace & stack_trac
         sizeof(Int64);                         // size
     /// Write should be atomic to avoid overlaps
     /// (since recursive collect() is possible)
-    static_assert(buf_size < PIPE_BUF, "Only write of PIPE_BUF to pipe is atomic");
+    // static_assert(buf_size < PIPE_BUF, "Only write of PIPE_BUF to pipe is atomic");
 
     char buffer[buf_size];
     WriteBufferFromFileDescriptorDiscardOnFailure out(pipe.fds_rw[1], buf_size, buffer);

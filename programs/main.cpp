@@ -61,6 +61,7 @@ int mainEntryClickHouseStart(int argc, char ** argv);
 int mainEntryClickHouseStop(int argc, char ** argv);
 int mainEntryClickHouseStatus(int argc, char ** argv);
 int mainEntryClickHouseRestart(int argc, char ** argv);
+int mainEntryClickHouseExecutor(int argc, char ** argv);
 #endif
 
 int mainEntryClickHouseHashBinary(int, char **)
@@ -120,6 +121,7 @@ std::pair<const char *, MainFunc> clickhouse_applications[] =
     {"restart", mainEntryClickHouseRestart},
 #endif
     {"hash-binary", mainEntryClickHouseHashBinary},
+    {"executor", mainEntryClickHouseExecutor},
 };
 
 
