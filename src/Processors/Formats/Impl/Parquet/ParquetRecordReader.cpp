@@ -64,12 +64,13 @@ public:
 
     ColumnWithTypeAndName readBatch(UInt64 rows_num, const String & name) override
     {
-        auto col = ColumnTuple::create(sub_column_readers.size());
+        MutableColumns cols(sub_column_readers.size());
         for (size_t i = 0; i < sub_column_readers.size(); i++)
         {
-            col->getColumnPtr(i) = sub_column_readers[i]->readBatch(rows_num, ch_tuple_type->getElementNames()[i]).column;
+            auto col_type_name = sub_column_readers[i]->readBatch(rows_num, ch_tuple_type->getElementNames()[i]);
+            cols[i] = castColumn(col_type_name, ch_tuple_type->getElement(i))->assumeMutable();
         }
-        return {std::move(col), ch_tuple_type, name};
+        return {ColumnTuple::create(std::move(cols)), ch_tuple_type, name};
     }
 
 private:
