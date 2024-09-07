@@ -31,7 +31,7 @@ public:
 
 private:
     const parquet::ColumnDescriptor & col_descriptor;
-    DataTypePtr base_data_type;
+    DataTypePtr base_data_type; // TODO ch_data_type
     std::unique_ptr<parquet::ColumnChunkMetaData> col_chunk_meta;
     std::unique_ptr<parquet::PageReader> parquet_page_reader;
     std::unique_ptr<ParquetDataValuesReader> data_values_reader;

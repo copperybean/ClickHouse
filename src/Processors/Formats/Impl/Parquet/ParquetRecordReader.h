@@ -14,13 +14,24 @@
 namespace DB
 {
 
+class IParquetColReaderFactory
+{
+public:
+    virtual std::unique_ptr<ParquetColumnReader> makeReader(parquet::RowGroupReader & row_group_reader) = 0;
+
+    virtual ~IParquetColReaderFactory() = default;
+};
+
+using ParquetColReaderFactoryPtr = std::unique_ptr<IParquetColReaderFactory>;
+using ParquetColReaderFactories = std::vector<std::unique_ptr<IParquetColReaderFactory>>;
+
 class ParquetRecordReader
 {
 public:
     ParquetRecordReader(
         Block header_,
-        parquet::ArrowReaderProperties arrow_properties_,
-        parquet::ReaderProperties reader_properties_,
+        const parquet::ArrowReaderProperties & arrow_properties,
+        const parquet::ReaderProperties & reader_properties,
         std::shared_ptr<::arrow::io::RandomAccessFile> arrow_file,
         const FormatSettings & format_settings,
         std::vector<int> row_groups_indices_,
@@ -30,16 +41,13 @@ public:
 
 private:
     std::unique_ptr<parquet::ParquetFileReader> file_reader;
-    parquet::ArrowReaderProperties arrow_properties;
 
     Block header;
-
-    std::shared_ptr<parquet::RowGroupReader> cur_row_group_reader;
+    ParquetColReaderFactories col_reader_factories;
     ParquetColReaders column_readers;
 
     UInt64 max_block_size;
 
-    std::vector<int> parquet_col_indice;
     std::vector<int> row_groups_indices;
     UInt64 left_rows;
     UInt64 cur_row_group_left_rows = 0;
