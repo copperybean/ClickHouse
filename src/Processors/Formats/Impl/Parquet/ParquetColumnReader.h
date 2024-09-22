@@ -16,10 +16,16 @@ class DataPageV2;
 namespace DB
 {
 
+struct RepeatedColumn
+{
+    ColumnWithTypeAndName detailed_column;
+    Columns offsets_layers;
+}
+
 class ParquetColumnReader
 {
 public:
-    virtual ColumnWithTypeAndName readBatch(UInt64 rows_num, const String & name) = 0;
+    virtual RepeatedColumn readBatch(UInt64 rows_num, const String & name) = 0;
 
     virtual ~ParquetColumnReader() = default;
 };

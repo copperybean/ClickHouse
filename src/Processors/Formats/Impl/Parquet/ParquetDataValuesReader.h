@@ -18,13 +18,14 @@ namespace DB
 class RleValuesReader
 {
 public:
-    RleValuesReader(std::unique_ptr<arrow::bit_util::BitReader> bit_reader_, Int32 bit_width_);
+    RleValuesReader(std::unique_ptr<arrow::bit_util::BitReader> bit_reader_, UInt32 num_values, Int32 bit_width_);
 
     /**
      * @brief Used when the bit_width is 0, so all elements have same value.
      */
-    explicit RleValuesReader(UInt32 total_size, Int32 val = 0)
-        : bit_reader(nullptr), bit_width(0), cur_group_size(total_size), cur_value(val), cur_group_is_packed(false)
+    explicit RleValuesReader(UInt32 num_values, Int32 val = 0)
+        : bit_reader(nullptr), bit_width(0), left_values_num(num_values)
+        , cur_group_size(num_all_values), cur_value(val), cur_group_is_packed(false)
         {}
 
     void nextGroup();
@@ -43,6 +44,15 @@ public:
      */
     template <typename IndividualVisitor, typename RepeatedVisitor>
     void visitValues(UInt32 num_values, IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor);
+
+    /**
+     * @brief Similar to visitValues, with the exception that the finish condition is determined by the visitor
+     * 
+     * @tparam IndividualVisitor Signature: bool(Int32 val), return false if finished exclusively at current value
+     * @tparam RepeatedVisitor Signature: UInt32(UInt32 count, Int32 val), return the consumed values number
+     */
+    template <typename IndividualVisitor, typename RepeatedVisitor>
+    UInt32 visitValuesConditionally(IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor)
 
     /**
      * @brief Visit num_values elements by parsed nullability.
@@ -119,6 +129,7 @@ private:
     std::vector<Int32> cur_packed_bit_values;
     std::vector<UInt8> valid_index_steps;
 
+    UInt32 left_values_num;
     const Int32 bit_width;
 
     UInt32 cur_group_size = 0;

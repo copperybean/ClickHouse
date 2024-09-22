@@ -15,8 +15,8 @@ namespace ErrorCodes
 }
 
 RleValuesReader::RleValuesReader(
-    std::unique_ptr<arrow::bit_util::BitReader> bit_reader_, Int32 bit_width_)
-    : bit_reader(std::move(bit_reader_)), bit_width(bit_width_)
+    std::unique_ptr<arrow::bit_util::BitReader> bit_reader_, UInt32 num_values, Int32 bit_width_)
+    : bit_reader(std::move(bit_reader_)), left_values_num(num_values), bit_width(bit_width_)
 {
     if (unlikely(bit_width >= 64))
     {
@@ -57,6 +57,8 @@ void RleValuesReader::visitValues(
     UInt32 num_values, IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor)
 {
     // refer to: VisitNullBitmapInline in visitor_inline.h
+    assert(left_values_num >= num_values);
+    left_values_num -= num_values;
     while (num_values)
     {
         nextGroupIfNecessary();
@@ -76,6 +78,36 @@ void RleValuesReader::visitValues(
         cur_group_cursor += cur_count;
         num_values -= cur_count;
     }
+}
+
+template <typename IndividualVisitor, typename RepeatedVisitor>
+UInt32 RleValuesReader::visitValuesConditionally(
+    IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor)
+{
+    auto left_values_num_bak = left_values_num;
+    while (bool flag = true; flag && left_values_num;)
+    {
+        nextGroupIfNecessary();
+        if (cur_group_is_packed)
+        {
+            size_t group_cursor = cur_group_cursor;
+            for (; flag && group_cursor < cur_group_size; group_cursor++)
+            {
+                flag &= individual_visitor(cur_packed_bit_values[group_cursor]);
+            }
+            left_values_num -= (group_cursor - cur_group_cursor);
+            cur_group_cursor = group_cursor;
+        }
+        else
+        {
+            auto cur_left = curGroupLeft();
+            auto consumed_num = repeated_visitor(cur_left, cur_value);
+            flag = (consumed_num == cur_left);
+            left_values_num -= consumed_num;
+            cur_group_cursor += consumed_num;
+        }
+    }
+    return left_values_num_bak - left_values_num;
 }
 
 template <typename IndividualVisitor, typename RepeatedVisitor>

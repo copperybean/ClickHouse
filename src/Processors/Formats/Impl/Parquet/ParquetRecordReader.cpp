@@ -49,6 +49,7 @@ namespace
 {
 
 using DataTypeTuplePtr = std::shared_ptr<const DataTypeTuple>;
+using DataTypeArrayPtr = std::shared_ptr<const DataTypeArray>;
 
 class ParquetTupleColReader : public ParquetColumnReader
 {
@@ -62,8 +63,38 @@ public:
         assert(sub_column_readers.size() == ch_tuple_type->getElementNames().size());
     }
 
+    RepeatedColumn readBatch(UInt64 rows_num, const String & name) override
+    {
+        MutableColumns cols(sub_column_readers.size());
+        for (size_t i = 0; i < sub_column_readers.size(); i++)
+        {
+            auto sub_type = ch_tuple_type->getElementNames()[i];
+            auto col_type_name = sub_column_readers[i]->readBatch(rows_num, sub_type).detailed_column;
+            cols[i] = castColumn(col_type_name, ch_tuple_type->getElement(i))->assumeMutable();
+        }
+        return {{ColumnTuple::create(std::move(cols)), ch_tuple_type, name}, ;
+    }
+
+private:
+    DataTypeTuplePtr ch_tuple_type;
+    ParquetColReaders sub_column_readers;
+};
+
+class ParquetArrayColReader : public ParquetColumnReader
+{
+public:
+    ParquetArrayColReader(
+        DataTypeArrayPtr ch_array_type_,
+        ParquetColReaderPtr nested_column_reader_)
+        : ch_tuple_type(ch_tuple_type_)
+        , nested_column_reader(std::move(nested_column_reader_))
+    {}
+
     ColumnWithTypeAndName readBatch(UInt64 rows_num, const String & name) override
     {
+        auto rep_column = nested_column_reader->readBatch(rows_num, ch_array_type->getNestedType());
+        auto col_array = ColumnArray::create(rep_column.column, rep_column.)
+
         MutableColumns cols(sub_column_readers.size());
         for (size_t i = 0; i < sub_column_readers.size(); i++)
         {
@@ -74,8 +105,8 @@ public:
     }
 
 private:
-    DataTypeTuplePtr ch_tuple_type;
-    ParquetColReaders sub_column_readers;
+    DataTypeArrayPtr ch_array_type;
+    ParquetColReaderPtr nested_column_reader;
 };
 
 
@@ -125,6 +156,33 @@ private:
     DataTypeTuplePtr ch_tuple_type;
 };
 
+class ArrayColReaderFactory : public IParquetColReaderFactory
+{
+public:
+    ArrayColReaderFactory(
+        ParquetColReaderFactoryPtr child_reader_factory_,
+        DataTypeArrayPtr ch_array_type_)
+        : child_reader_factory(std::move(child_reader_factory_))
+        , ch_array_type(ch_array_type_)
+        {}
+
+    std::unique_ptr<ParquetColumnReader> makeReader(parquet::RowGroupReader & row_group_reader) override
+    {
+        ParquetColReaders readers;
+        readers.reserve(reader_factories.size());
+        for (size_t i = 0; i < reader_factories.size(); i++)
+        {
+            readers.emplace_back(reader_factories[i]->makeReader(row_group_reader));
+        }
+        return std::make_unique<ParquetTupleColReader>(ch_tuple_type, std::move(readers));
+    }
+
+private:
+
+    ParquetColReaderFactoryPtr child_reader_factory;
+    DataTypeTuplePtr ch_array_type;
+};
+
 class LeafColReaderFactory : public IParquetColReaderFactory
 {
 public:
@@ -161,12 +219,13 @@ private:
         parquet::RowGroupReader & row_group_reader, const parquet::IntLogicalType & int_type);
 
     template<class DataType>
-    auto makeLeafReader(parquet::RowGroupReader & row_group_reader)
+    auto makeLeafReader(parquet::RowGroupReader & row_group_reader, DataTypePtr data_type = std::make_shared<DataType>())
     {
+        auto chunkMeta = row_group_reader.metadata()->ColumnChunk(col_index);
+        auto repeat_ratio = chunkMeta->num_values() * 1.0 / row_group_reader.metadata()->num_rows(); 
         return std::make_unique<ParquetLeafColReader<typename DataType::ColumnType>>(
-            col_descriptor, std::make_shared<DataType>(),
-            row_group_reader.metadata()->ColumnChunk(col_index),
-            row_group_reader.GetColumnPageReader(col_index));
+            col_descriptor, std::move(data_type), std::move(chunk_meta),
+            row_group_reader.GetColumnPageReader(col_index), repeat_ratio);
     }
 
     template<class DecimalType>
@@ -174,10 +233,7 @@ private:
     {
         auto data_type = std::make_shared<DataTypeDecimal<DecimalType>>(
             col_descriptor.type_precision(), col_descriptor.type_scale());
-        return std::make_unique<ParquetLeafColReader<ColumnDecimal<DecimalType>>>(
-            col_descriptor, std::move(data_type),
-            row_group_reader.metadata()->ColumnChunk(col_index),
-            row_group_reader.GetColumnPageReader(col_index));
+        return makeLeafReader<DataTypeDecimal<DecimalType>>(row_group_reader, std::move(data_type));
     }
 
     std::unique_ptr<ParquetColumnReader> throwUnsupported(std::string msg = "")
@@ -251,10 +307,7 @@ std::unique_ptr<ParquetColumnReader> LeafColReaderFactory::fromInt64(parquet::Ro
         {
             const auto & tm_type = dynamic_cast<const parquet::TimestampLogicalType &>(*col_descriptor.logical_type());
             auto read_type = std::make_shared<DataTypeDateTime64>(getScaleFromLogicalTimestamp(tm_type.time_unit()));
-            return std::make_unique<ParquetLeafColReader<ColumnDecimal<DateTime64>>>(
-                col_descriptor, std::move(read_type),
-                row_group_reader.metadata()->ColumnChunk(col_index),
-                row_group_reader.GetColumnPageReader(col_index));
+            return makeLeafReader<DataTypeDecimal<DateTime64>>(row_group_reader, std::move(read_type));
         }
         case parquet::LogicalType::Type::DECIMAL:
             return makeDecimalLeafReader<Decimal64>(row_group_reader);
@@ -350,10 +403,7 @@ std::unique_ptr<ParquetColumnReader> LeafColReaderFactory::makeReader(parquet::R
                 auto scale = getScaleFromArrowTimeUnit(arrow_properties.coerce_int96_timestamp_unit());
                 read_type = std::make_shared<DataTypeDateTime64>(scale);
             }
-            return std::make_unique<ParquetLeafColReader<ColumnDecimal<DateTime64>>>(
-                col_descriptor, read_type,
-                row_group_reader.metadata()->ColumnChunk(col_index),
-                row_group_reader.GetColumnPageReader(col_index));
+            return makeLeafReader<DataTypeDecimal<DateTime64>>(row_group_reader, std::move(read_type));
         }
         case parquet::Type::FLOAT:
             return makeLeafReader<DataTypeFloat32>(row_group_reader);
@@ -634,7 +684,7 @@ Chunk ParquetRecordReader::readChunk()
     for (size_t i = 0; i < header.columns(); i++)
     {
         columns[i] = castColumn(
-            column_readers[i]->readBatch(num_rows_read, header.getByPosition(i).name),
+            column_readers[i]->readBatch(num_rows_read, header.getByPosition(i).name).detailed_column,
             header.getByPosition(i).type);
     }
     left_rows -= num_rows_read;

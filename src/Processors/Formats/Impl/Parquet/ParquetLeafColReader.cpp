@@ -215,17 +215,19 @@ ParquetLeafColReader<TColumn>::ParquetLeafColReader(
     const parquet::ColumnDescriptor & col_descriptor_,
     DataTypePtr base_type_,
     std::unique_ptr<parquet::ColumnChunkMetaData> meta_,
-    std::unique_ptr<parquet::PageReader> reader_)
+    std::unique_ptr<parquet::PageReader> reader_,
+    size_t reptition_depth_)
     : col_descriptor(col_descriptor_)
     , base_data_type(base_type_)
     , col_chunk_meta(std::move(meta_))
     , parquet_page_reader(std::move(reader_))
+    , reptition_depth(reptition_depth_)
     , log(&Poco::Logger::get("ParquetLeafColReader"))
 {
 }
 
 template <typename TColumn>
-ColumnWithTypeAndName ParquetLeafColReader<TColumn>::readBatch(UInt64 rows_num, const String & name)
+RepeatedColumn ParquetLeafColReader<TColumn>::readBatch(UInt64 rows_num, const String & name)
 {
     reading_rows_num = rows_num;
     auto readPageIfEmpty = [&]()
@@ -242,14 +244,14 @@ ColumnWithTypeAndName ParquetLeafColReader<TColumn>::readBatch(UInt64 rows_num, 
         // if dictionary page encountered, another page should be read
         readPageIfEmpty();
 
-        auto read_values = static_cast<UInt32>(std::min(rows_num, static_cast<UInt64>(cur_page_values)));
+        auto [read_rows, read_values] = readRepeatedOffsets(rows_num);
         data_values_reader->readBatch(column, *null_map, read_values);
 
         cur_page_values -= read_values;
-        rows_num -= read_values;
+        rows_num -= read_rows;
     }
 
-    return releaseColumn(name);
+    return {releaseColumn(name), {}};
 }
 
 template <>
@@ -272,6 +274,14 @@ void ParquetLeafColReader<ColumnString>::resetColumn(UInt64 rows_num)
         null_map = std::make_unique<LazyNullMap>(rows_num);
         column = ColumnString::create();
         reserveColumnStrRows(column, rows_num);
+    }
+
+    if (col_descriptor->max_repetition_level())
+    {
+        auto estimated_values = static_cast<size_t>(repeat_ratio * 1.2 * rows_num);
+        offsets_layers.resize(col_descriptor->max_repetition_level());
+        for (auto * o : offsets_layers)
+            o.reserve(offsets_layers);
     }
 }
 
@@ -411,42 +421,36 @@ void ParquetLeafColReader<TColumn>::readPage()
 template <typename TColumn>
 void ParquetLeafColReader<TColumn>::readPageV1(const parquet::DataPageV1 & page)
 {
-    static parquet::LevelDecoder repetition_level_decoder;
-
     cur_page_values = page.num_values();
 
     // refer to: VectorizedColumnReader::readPageV1 in Spark and LevelDecoder::SetData in column_reader.cc
-    if (page.definition_level_encoding() != parquet::Encoding::RLE && col_descriptor.max_definition_level() != 0)
+    if ((col_descriptor.max_definition_level() != 0 && page.definition_level_encoding() != parquet::Encoding::RLE) ||
+        (col_descriptor.max_repetition_level() != 0 && page.repetition_level_encoding() != parquet::Encoding::RLE))
     {
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, "Unsupported encoding: {}", page.definition_level_encoding());
+        throw Exception(
+            ErrorCodes::PARQUET_EXCEPTION, "Unsupported def level encoding: {} and rep level encoding: {}",
+            page.definition_level_encoding(), page.repetition_level_encoding());
     }
     const auto * buffer =  page.data();
     auto max_size = page.size();
 
-    if (col_descriptor.max_repetition_level() > 0)
+    auto createRleValuesReader = [&](int16_t max_val)
     {
-        auto rep_levels_bytes = repetition_level_decoder.SetData(
-            page.repetition_level_encoding(), col_descriptor.max_repetition_level(), 0, buffer, max_size);
-        buffer += rep_levels_bytes;
-        max_size -= rep_levels_bytes;
-    }
+        assert(max_val >= 0);
+        if (!max_val)
+            return std::make_unique<RleValuesReader>(cur_page_values);
 
-    assert(col_descriptor.max_definition_level() >= 0);
-    std::unique_ptr<RleValuesReader> def_level_reader;
-    if (col_descriptor.max_definition_level() > 0)
-    {
-        auto bit_width = arrow::bit_util::Log2(col_descriptor.max_definition_level() + 1);
+        auto bit_width = arrow::bit_util::Log2(max_val + 1);
         auto num_bytes = ::arrow::util::SafeLoadAs<int32_t>(buffer);
         auto bit_reader = std::make_unique<arrow::bit_util::BitReader>(buffer + 4, num_bytes);
         num_bytes += 4;
         buffer += num_bytes;
         max_size -= num_bytes;
-        def_level_reader = std::make_unique<RleValuesReader>(std::move(bit_reader), bit_width);
-    }
-    else
-    {
-        def_level_reader = std::make_unique<RleValuesReader>(page.num_values());
-    }
+        return std::make_unique<RleValuesReader>(std::move(bit_reader), cur_page_values, bit_width);
+    };
+    rep_level_reader = createRleValuesReader(col_descriptor.max_repetition_level());
+    auto def_level_reader = createRleValuesReader(col_descriptor.max_definition_level());
+
 
     switch (page.encoding())
     {
@@ -481,8 +485,8 @@ void ParquetLeafColReader<TColumn>::readPageV1(const parquet::DataPageV1 & page)
             // refer to: DictDecoderImpl::SetData in encoding.cc
             auto bit_width = *buffer;
             auto bit_reader = std::make_unique<arrow::bit_util::BitReader>(++buffer, --max_size);
-            data_values_reader = createDictReader(
-                std::move(def_level_reader), std::make_unique<RleValuesReader>(std::move(bit_reader), bit_width));
+            auto values_reader = std::make_unique<RleValuesReader>(std::move(bit_reader), cur_page_values, bit_width);
+            data_values_reader = createDictReader(std::move(def_level_reader), values_reader);
             break;
         }
         case parquet::Encoding::BYTE_STREAM_SPLIT:
@@ -500,6 +504,48 @@ template <typename TColumn>
 void ParquetLeafColReader<TColumn>::readPageV2(const parquet::DataPageV2 & /*page*/)
 {
     throw Exception(ErrorCodes::NOT_IMPLEMENTED, "read page V2 is not implemented yet");
+}
+
+template <typename TColumn>
+UInt32 ParquetLeafColReader<TColumn>::readRepeatedOffsets(UInt64 rows_num)
+{
+    if (!col_descriptor->max_repetition_level())
+    {
+        auto read_rows = static_cast<UInt32>(std::min(rows_num, static_cast<UInt64>(cur_page_values)));
+        return {read_rows, read_rows};
+    }
+
+    auto last_rows_num = offsets_layers[0].size();
+    auto read_values = rep_level_reader->visitValuesConditionally(
+        /* individual_visitor */ [&](Int32 val)
+        {
+            for (size_t i = val; i < offsets_layers.size(); i++)
+            {
+                offsets_layers[i].push_back(offsets_layers[i].end() + 1);
+            }
+            if (val > 0)
+            {
+                offsets_layers[val - 1].end()++;
+            }
+        },
+        /* repeated_visitor */ [&](UInt32 count, Int32 val)
+        {
+            if (val == 0)
+            {}
+            else
+            {
+                for (size_t i = val; i < offsets_layers.size(); i++)
+                {
+                    for (UInt32 j = 0; j < count; j++)
+                    {
+                        offset_layers[i].push_back(offset_layers[i].end() + 1);
+                    }
+                }
+                offsets_layers[val - 1].end() += count;
+            }
+        }
+    )
+    return {offset_layers[i].size() - last_rows_num, read_values};
 }
 
 template <typename TColumn>
