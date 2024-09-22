@@ -25,9 +25,10 @@ public:
         const parquet::ColumnDescriptor & col_descriptor_,
         DataTypePtr base_type_,
         std::unique_ptr<parquet::ColumnChunkMetaData> meta_,
-        std::unique_ptr<parquet::PageReader> reader_);
+        std::unique_ptr<parquet::PageReader> reader_,
+        std::vector<Int16> lists_def_levels_);
 
-    ColumnWithTypeAndName readBatch(UInt64 rows_num, const String & name) override;
+    RepeatedColumn readBatch(UInt64 rows_num, const String & name) override;
 
 private:
     const parquet::ColumnDescriptor & col_descriptor;
@@ -35,9 +36,13 @@ private:
     std::unique_ptr<parquet::ColumnChunkMetaData> col_chunk_meta;
     std::unique_ptr<parquet::PageReader> parquet_page_reader;
     std::unique_ptr<ParquetDataValuesReader> data_values_reader;
+    std::unique_ptr<RleValuesReader> rep_level_reader;
 
     MutableColumnPtr column;
     std::unique_ptr<LazyNullMap> null_map;
+    std::vector<Int16> lists_def_levels;
+    std::vector<Offsets> lists_offsets;
+    std::vector<UInt32> lists_offsets_update_indice;
 
     ColumnPtr dictionary;
 
@@ -54,6 +59,12 @@ private:
     void readPage();
     void readPageV1(const parquet::DataPageV1 & page);
     void readPageV2(const parquet::DataPageV2 & page);
+    
+    /// The first value in returned pair is the rows number of root column actually read,
+    /// while the second value is the correspongding values number of leaf column
+    std::pair<UInt32, UInt32> readRepeatedOffsets(UInt64 rows_num);
+
+    void updateRepeatedOffsets(const PaddedPODArray<RangedShortElem> & ranged_def_levels);
 
     std::unique_ptr<ParquetDataValuesReader> createDictReader(
         std::unique_ptr<RleValuesReader> def_level_reader, std::unique_ptr<RleValuesReader> rle_data_reader);

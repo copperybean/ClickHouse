@@ -69,8 +69,6 @@ void updateObjectColumns(
     const ColumnsDescription & storage_columns,
     const NamesAndTypesList & new_columns);
 
-using DataTypeTuplePtr = std::shared_ptr<DataTypeTuple>;
-
 /// Flattens nested Tuple to plain Tuple. I.e extracts all paths and types from tuple.
 /// E.g. Tuple(t Tuple(c1 UInt32, c2 String), c3 UInt64) -> Tuple(t.c1 UInt32, t.c2 String, c3 UInt32)
 std::pair<PathsInData, DataTypes> flattenTuple(const DataTypePtr & type);

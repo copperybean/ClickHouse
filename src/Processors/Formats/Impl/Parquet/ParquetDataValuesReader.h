@@ -15,16 +15,28 @@
 namespace DB
 {
 
+struct RangedShortElem
+{
+    Int16 val;
+    UInt16 len;
+};
+
+using RangedShortElemsVisitor = std::function<void(const PaddedPODArray<RangedShortElem> &)>;
+
 class RleValuesReader
 {
 public:
-    RleValuesReader(std::unique_ptr<arrow::bit_util::BitReader> bit_reader_, Int32 bit_width_);
+    RleValuesReader(
+        std::unique_ptr<arrow::bit_util::BitReader> bit_reader_,
+        UInt32 num_values, Int32 bit_width_, Int32 skip_until_val_ = 0);
 
     /**
      * @brief Used when the bit_width is 0, so all elements have same value.
      */
-    explicit RleValuesReader(UInt32 total_size, Int32 val = 0)
-        : bit_reader(nullptr), bit_width(0), cur_group_size(total_size), cur_value(val), cur_group_is_packed(false)
+    explicit RleValuesReader(UInt32 total_num_values, Int32 val = 0)
+        : bit_reader(nullptr), bit_width(0), left_values_num(total_num_values)
+        , cur_group_size(total_num_values), cur_value(val), cur_group_is_packed(false)
+        , skip_until_val(0)
         {}
 
     void nextGroup();
@@ -43,6 +55,15 @@ public:
      */
     template <typename IndividualVisitor, typename RepeatedVisitor>
     void visitValues(UInt32 num_values, IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor);
+
+    /**
+     * @brief Similar to visitValues, with the exception that the finish condition is determined by the visitor
+     * 
+     * @tparam IndividualVisitor Signature: bool(Int32 val), return false if finished exclusively at current value
+     * @tparam RepeatedVisitor Signature: UInt32(UInt32 count, Int32 val), return the consumed values number
+     */
+    template <typename IndividualVisitor, typename RepeatedVisitor>
+    UInt32 visitValuesConditionally(IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor);
 
     /**
      * @brief Visit num_values elements by parsed nullability.
@@ -75,7 +96,7 @@ public:
      *  from i-th valid element (include) to (i+1)-th valid element (exclude).
      *
      *  take following BitPacked group values for example, and assuming max_def_level is 1:
-     *      [1,   0,    1,   1,   0,    1    ]
+     *      [0,   1,    0,   0,   1,    0    ]
      *       null valid null null valid null
      *  the second line shows the corresponding validation state,
      *  then the valid_index_steps has values [1, 3, 2].
@@ -92,6 +113,12 @@ public:
         IndividualNullVisitor && null_visitor,
         SteppedValidVisitor && stepped_valid_visitor,
         RepeatedVisitor && repeated_visitor);
+
+    void consumeVisitedShortValues(RangedShortElemsVisitor visitor)
+    {
+        visitor(ranged_short_values);
+        ranged_short_values.clear();
+    }
 
     /**
      * @brief Set the Values to column_data directly
@@ -114,12 +141,30 @@ public:
         ValueGetter && val_getter);
 
 private:
+    inline void updateValues(UInt32 num_values)
+    {
+        assert(left_values_num >= num_values);
+        left_values_num -= num_values;
+    }
+
+    /**
+     * To skip values according to the condition "val <= skip_until_val" in next visit_batch_size elements.
+     * If skip_until_val is bigger than 0, then the next visit_batch_size values of current group
+     * will be recorded in ranged_short_values.
+     * Return number of elements left both in current group and this batch.
+     */
+    UInt32 skipCurGroupValues(UInt32 & visit_batch_size);
+
+private:
     std::unique_ptr<arrow::bit_util::BitReader> bit_reader;
 
     std::vector<Int32> cur_packed_bit_values;
     std::vector<UInt8> valid_index_steps;
+    PaddedPODArray<RangedShortElem> ranged_short_values;
 
+    UInt32 left_values_num;
     const Int32 bit_width;
+    const Int32 skip_until_val;
 
     UInt32 cur_group_size = 0;
     UInt32 cur_group_cursor = 0;
@@ -136,6 +181,14 @@ public:
     virtual void readBatch(MutableColumnPtr & column, LazyNullMap & null_map, UInt32 num_values) = 0;
 
     virtual ~ParquetDataValuesReader() = default;
+
+    void consumeVisitedDefLevels(RangedShortElemsVisitor visitor)
+    {
+        getDefLevelReader().consumeVisitedShortValues(std::move(visitor));
+    }
+
+protected:
+    virtual RleValuesReader & getDefLevelReader() = 0;
 };
 
 using ParquetDataValuesReaderPtr = std::unique_ptr<ParquetDataValuesReader>;
@@ -165,6 +218,9 @@ public:
     {}
 
     void readBatch(MutableColumnPtr & col_ptr, LazyNullMap & null_map, UInt32 num_values) override;
+
+protected:
+    RleValuesReader & getDefLevelReader() { return def_level_reader; };
 
 private:
     Int32 max_def_level;
@@ -196,6 +252,9 @@ public:
 
     void readBatch(MutableColumnPtr & col_ptr, LazyNullMap & null_map, UInt32 num_values) override;
 
+protected:
+    RleValuesReader & getDefLevelReader() { return def_level_reader; };
+
 private:
     Int32 max_def_level;
     Int32 elem_bytes_num;
@@ -224,6 +283,9 @@ public:
     {}
 
     void readBatch(MutableColumnPtr & index_col, LazyNullMap & null_map, UInt32 num_values) override;
+
+protected:
+    RleValuesReader & getDefLevelReader() { return def_level_reader; };
 
 private:
     Int32 max_def_level;
@@ -254,6 +316,9 @@ public:
     {}
 
     void readBatch(MutableColumnPtr & col_ptr, LazyNullMap & null_map, UInt32 num_values) override;
+
+protected:
+    RleValuesReader & getDefLevelReader() { return def_level_reader; };
 
 private:
     Int32 max_def_level;

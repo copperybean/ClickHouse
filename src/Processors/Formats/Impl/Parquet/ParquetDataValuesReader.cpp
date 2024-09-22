@@ -15,13 +15,22 @@ namespace ErrorCodes
 }
 
 RleValuesReader::RleValuesReader(
-    std::unique_ptr<arrow::bit_util::BitReader> bit_reader_, Int32 bit_width_)
-    : bit_reader(std::move(bit_reader_)), bit_width(bit_width_)
+    std::unique_ptr<arrow::bit_util::BitReader> bit_reader_,
+    UInt32 num_values, Int32 bit_width_, Int32 skip_until_val_ = 0)
+    : bit_reader(std::move(bit_reader_)), left_values_num(num_values), bit_width(bit_width_)
+    , skip_until_val(skip_until_val_)
 {
     if (unlikely(bit_width >= 64))
     {
         // e.g. in GetValue_ in bit_stream_utils.h, uint64 type is used to read bit values
         throw Exception(ErrorCodes::PARQUET_EXCEPTION, "unsupported bit width {}", bit_width);
+    }
+
+    if (skip_until_val)
+    {
+        auto estimate_elements = bit_reader->bytes_left() * 8 / bit_width;
+        UInt32 len = 1.2 * DEFAULT_BLOCK_SIZE * estimate_elements / num_values;
+        ranged_short_values.reserve(std::min(len, num_values));
     }
 }
 
@@ -57,9 +66,10 @@ void RleValuesReader::visitValues(
     UInt32 num_values, IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor)
 {
     // refer to: VisitNullBitmapInline in visitor_inline.h
-    while (num_values)
+    updateValues(num_values);
+
+    while (skipCurGroupValues(num_values))
     {
-        nextGroupIfNecessary();
         auto cur_count = std::min(num_values, curGroupLeft());
 
         if (cur_group_is_packed)
@@ -79,6 +89,39 @@ void RleValuesReader::visitValues(
 }
 
 template <typename IndividualVisitor, typename RepeatedVisitor>
+UInt32 RleValuesReader::visitValuesConditionally(
+    IndividualVisitor && individual_visitor, RepeatedVisitor && repeated_visitor)
+{
+    // skip mode is not supported for this visitor, and it's also not needed
+    assert(!skip_until_val);
+
+    auto left_values_num_bak = left_values_num;
+    while (bool flag = true; flag && left_values_num;)
+    {
+        nextGroupIfNecessary();
+        if (cur_group_is_packed)
+        {
+            size_t group_cursor = cur_group_cursor;
+            for (; flag && group_cursor < cur_group_size; group_cursor++)
+            {
+                flag &= individual_visitor(cur_packed_bit_values[group_cursor]);
+            }
+            left_values_num -= (group_cursor - cur_group_cursor);
+            cur_group_cursor = group_cursor;
+        }
+        else
+        {
+            auto cur_left = curGroupLeft();
+            auto consumed_num = repeated_visitor(cur_left, cur_value);
+            flag = (consumed_num == cur_left);
+            left_values_num -= consumed_num;
+            cur_group_cursor += consumed_num;
+        }
+    }
+    return left_values_num_bak - left_values_num;
+}
+
+template <typename IndividualVisitor, typename RepeatedVisitor>
 void RleValuesReader::visitNullableValues(
     size_t cursor,
     UInt32 num_values,
@@ -87,9 +130,10 @@ void RleValuesReader::visitNullableValues(
     IndividualVisitor && individual_visitor,
     RepeatedVisitor && repeated_visitor)
 {
-    while (num_values)
+    updateValues(num_values);
+
+    while (skipCurGroupValues(num_values))
     {
-        nextGroupIfNecessary();
         auto cur_count = std::min(num_values, curGroupLeft());
 
         if (cur_group_is_packed)
@@ -133,12 +177,13 @@ void RleValuesReader::visitNullableBySteps(
     SteppedValidVisitor && stepped_valid_visitor,
     RepeatedVisitor && repeated_visitor)
 {
+    updateValues(num_values);
+
     // refer to:
     // RleDecoder::GetBatch in rle_encoding.h and TypedColumnReaderImpl::ReadBatchSpaced in column_reader.cc
     // VectorizedRleValuesReader::readBatchInternal in Spark
-    while (num_values > 0)
+    while (skipCurGroupValues(num_values))
     {
-        nextGroupIfNecessary();
         auto cur_count = std::min(num_values, curGroupLeft());
 
         if (cur_group_is_packed)
@@ -182,6 +227,8 @@ void RleValuesReader::visitNullableBySteps(
 template <typename TValue, typename ValueGetter>
 void RleValuesReader::setValues(TValue * res_values, UInt32 num_values, ValueGetter && val_getter)
 {
+    updateValues(num_values);
+
     visitValues(
         num_values,
         /* individual_visitor */ [&](Int32 val)
@@ -202,6 +249,7 @@ void RleValuesReader::setValueBySteps(
     const std::vector<UInt8> & col_data_steps,
     ValueGetter && val_getter)
 {
+    updateValues(num_values);
     auto step_iterator = col_data_steps.begin();
     res_values += *(step_iterator++);
 
@@ -222,6 +270,96 @@ void RleValuesReader::setValueBySteps(
             }
         }
     );
+}
+
+UInt32 RleValuesReader::skipCurGroupValues(UInt32 & visit_batch_size)
+{
+    nextGroupIfNecessary();
+    if (!skip_until_val)
+    {
+        return visit_batch_size;
+    }
+
+    for (bool working = true; working;)
+    {
+        if (cur_group_is_packed)
+        {
+            /// ========================================
+            /// 1st example, assuming skip_until_val is 2
+            ///     cur_group_cursor ────┐
+            /// cur group: [ -  -  -  -  3   1   2   3   1   3   3   1  *  * ]
+            ///                          └─   visit_batch_size: 8   ─┘
+            ///
+            /// after process, the current group will be:
+            /// cur group: [ -  -  -  -  3  3  3  3  *  * ]
+            /// visit_batch_size will be changed from 8 to 4, while cur_group_cursor will not be changed,
+            /// and the execution in this method will be finished
+            ///
+            ///
+            /// ========================================
+            /// 2nd example, assuming skip_until_val is 2
+            ///     cur_group_cursor ────┐
+            /// cur group: [ -  -  -  -  1  1  2  2  ]
+            ///                          └─ visit_batch_size: 100 ─┘
+            ///
+            /// after process, the current group will be:
+            /// cur group: [ -  -  -  - ]
+            /// visit_batch_size will be changed to 96.
+            /// Because curGroupLeft() is 0, next group should be loaded, and the for loop will be executed again
+            UInt32 valid_idx = cur_group_cursor;
+            auto group_end = std::min(cur_group_size, cur_group_cursor + visit_batch_size);
+            for (UInt32 i = cur_group_cursor; i < group_end; i++)
+            {
+                ranged_short_values.emplace_back(RangedShortElem{static_cast<Int16>(cur_packed_bit_values[i]), 1});
+                if (cur_packed_bit_values[i] > skip_until_val)
+                {
+                    cur_packed_bit_values[valid_idx++] = cur_packed_bit_values[i];
+                }
+            }
+            auto skipped_num = group_end - valid_idx;
+            if (skipped_num)
+            {
+                // Technically, it's inefficient to copy the tail elements every time,
+                // but DEFAULT_BLOCK_SIZE elements loaded each time, which is bigger than the group size,
+                // so the tailing copy may be called only once for each group.
+                std::copy(
+                    cur_packed_bit_values.begin() + group_end,
+                    cur_packed_bit_values.end(),
+                    cur_packed_bit_values.begin() + valid_idx);
+                visit_batch_size -= skipped_num;
+                cur_group_size -= skipped_num;
+                cur_packed_bit_values.resize(cur_group_size);
+            }
+        }
+        else
+        {
+            auto consuming_num = std::min(visit_batch_size, curGroupLeft());
+            UInt16 max_range_len = std::numeric_limits<UInt16>::max() - 1;
+            auto recording_num = consuming_num;
+            // Technically, visit_batch_size will not exceed DEFAULT_BLOCK_SIZE which is 65409 by default,
+            // so consuming_num will not exceed the max value of UInt16.
+            // While the following loop makes the logic more robust
+            for (; recording_num >= max_range_len; recording_num -= max_range_len)
+            {
+                ranged_short_values.emplace_back(RangedShortElem{static_cast<Int16>(cur_value), max_range_len});
+            }
+            if (recording_num)
+            {
+                ranged_short_values.emplace_back(
+                    RangedShortElem{static_cast<Int16>(cur_value), static_cast<UInt16>(recording_num)});
+            }
+
+            if (cur_value <= skip_until_val)
+            {
+                visit_batch_size -= consuming_num;
+                cur_group_size -= consuming_num;
+            }
+        }
+        working = (visit_batch_size && !curGroupLeft());
+        nextGroupIfNecessary();
+    }
+
+    return visit_batch_size;
 }
 
 

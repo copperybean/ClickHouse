@@ -48,40 +48,12 @@ namespace ErrorCodes
 namespace
 {
 
-using DataTypeTuplePtr = std::shared_ptr<const DataTypeTuple>;
-
-class ParquetTupleColReader : public ParquetColumnReader
-{
-public:
-    ParquetTupleColReader(
-        DataTypeTuplePtr ch_tuple_type_,
-        ParquetColReaders sub_column_readers_)
-        : ch_tuple_type(ch_tuple_type_)
-        , sub_column_readers(std::move(sub_column_readers_))
-    {
-        assert(sub_column_readers.size() == ch_tuple_type->getElementNames().size());
-    }
-
-    ColumnWithTypeAndName readBatch(UInt64 rows_num, const String & name) override
-    {
-        MutableColumns cols(sub_column_readers.size());
-        for (size_t i = 0; i < sub_column_readers.size(); i++)
-        {
-            auto col_type_name = sub_column_readers[i]->readBatch(rows_num, ch_tuple_type->getElementNames()[i]);
-            cols[i] = castColumn(col_type_name, ch_tuple_type->getElement(i))->assumeMutable();
-        }
-        return {ColumnTuple::create(std::move(cols)), ch_tuple_type, name};
-    }
-
-private:
-    DataTypeTuplePtr ch_tuple_type;
-    ParquetColReaders sub_column_readers;
-};
-
-
-
-
-
+bool hasStructListName(const std::string & name) {
+    // Special case mentioned in the format spec:
+    //   If the name is array or ends in _tuple, this should be a list of struct
+    //   even for single child elements.
+    return name == "array" || endsWith(name, "_tuple");
+}
 
 std::unique_ptr<parquet::ParquetFileReader> createFileReader(
     std::shared_ptr<::arrow::io::RandomAccessFile> arrow_file,
@@ -125,6 +97,28 @@ private:
     DataTypeTuplePtr ch_tuple_type;
 };
 
+class ArrayColReaderFactory : public IParquetColReaderFactory
+{
+public:
+    ArrayColReaderFactory(
+        ParquetColReaderFactoryPtr nested_reader_factory_,
+        DataTypeArrayPtr ch_array_type_)
+        : nested_reader_factory(std::move(nested_reader_factory_))
+        , ch_array_type(ch_array_type_)
+        {}
+
+    std::unique_ptr<ParquetColumnReader> makeReader(parquet::RowGroupReader & row_group_reader) override
+    {
+        auto nested_reader = nested_reader_factory->makeReader(row_group_reader);
+        return std::make_unique<ParquetArrayColReader>(ch_array_type, std::move(nested_reader));
+    }
+
+private:
+
+    ParquetColReaderFactoryPtr nested_reader_factory;
+    DataTypeTuplePtr ch_array_type;
+};
+
 class LeafColReaderFactory : public IParquetColReaderFactory
 {
 public:
@@ -132,11 +126,13 @@ public:
         int col_index_,
         const parquet::ArrowReaderProperties & arrow_properties_,
         const parquet::ColumnDescriptor & col_descriptor_,
-        DataTypePtr ch_type_)
+        DataTypePtr ch_type_,
+        std::vector<Int16> lists_def_levels_)
         : col_index(col_index_)
         , arrow_properties(arrow_properties_)
         , col_descriptor(col_descriptor_)
-        , ch_type(std::move(ch_type_)) {}
+        , ch_type(std::move(ch_type_))
+        , lists_def_levels(std::move(lists_def_levels_)) {}
 
     std::unique_ptr<ParquetColumnReader> makeReader(parquet::RowGroupReader & row_group_reader) override;
 
@@ -145,6 +141,7 @@ private:
     const parquet::ArrowReaderProperties & arrow_properties;
     const parquet::ColumnDescriptor & col_descriptor;
     DataTypePtr ch_type;
+    std::vector<Int16> lists_dev_levels;
 
 
     UInt32 getScaleFromLogicalTimestamp(parquet::LogicalType::TimeUnit::unit tm_unit);
@@ -161,12 +158,13 @@ private:
         parquet::RowGroupReader & row_group_reader, const parquet::IntLogicalType & int_type);
 
     template<class DataType>
-    auto makeLeafReader(parquet::RowGroupReader & row_group_reader)
+    auto makeLeafReader(parquet::RowGroupReader & row_group_reader, DataTypePtr data_type = std::make_shared<DataType>())
     {
+        // auto chunkMeta = row_group_reader.metadata()->ColumnChunk(col_index);
+        // auto repeat_ratio = chunkMeta->num_values() * 1.0 / row_group_reader.metadata()->num_rows(); 
         return std::make_unique<ParquetLeafColReader<typename DataType::ColumnType>>(
-            col_descriptor, std::make_shared<DataType>(),
-            row_group_reader.metadata()->ColumnChunk(col_index),
-            row_group_reader.GetColumnPageReader(col_index));
+            col_descriptor, std::move(data_type), std::move(chunk_meta),
+            row_group_reader.GetColumnPageReader(col_index), lists_def_levels);
     }
 
     template<class DecimalType>
@@ -174,10 +172,7 @@ private:
     {
         auto data_type = std::make_shared<DataTypeDecimal<DecimalType>>(
             col_descriptor.type_precision(), col_descriptor.type_scale());
-        return std::make_unique<ParquetLeafColReader<ColumnDecimal<DecimalType>>>(
-            col_descriptor, std::move(data_type),
-            row_group_reader.metadata()->ColumnChunk(col_index),
-            row_group_reader.GetColumnPageReader(col_index));
+        return makeLeafReader<DataTypeDecimal<DecimalType>>(row_group_reader, std::move(data_type));
     }
 
     std::unique_ptr<ParquetColumnReader> throwUnsupported(std::string msg = "")
@@ -251,10 +246,7 @@ std::unique_ptr<ParquetColumnReader> LeafColReaderFactory::fromInt64(parquet::Ro
         {
             const auto & tm_type = dynamic_cast<const parquet::TimestampLogicalType &>(*col_descriptor.logical_type());
             auto read_type = std::make_shared<DataTypeDateTime64>(getScaleFromLogicalTimestamp(tm_type.time_unit()));
-            return std::make_unique<ParquetLeafColReader<ColumnDecimal<DateTime64>>>(
-                col_descriptor, std::move(read_type),
-                row_group_reader.metadata()->ColumnChunk(col_index),
-                row_group_reader.GetColumnPageReader(col_index));
+            return makeLeafReader<DataTypeDecimal<DateTime64>>(row_group_reader, std::move(read_type));
         }
         case parquet::LogicalType::Type::DECIMAL:
             return makeDecimalLeafReader<Decimal64>(row_group_reader);
@@ -350,10 +342,7 @@ std::unique_ptr<ParquetColumnReader> LeafColReaderFactory::makeReader(parquet::R
                 auto scale = getScaleFromArrowTimeUnit(arrow_properties.coerce_int96_timestamp_unit());
                 read_type = std::make_shared<DataTypeDateTime64>(scale);
             }
-            return std::make_unique<ParquetLeafColReader<ColumnDecimal<DateTime64>>>(
-                col_descriptor, read_type,
-                row_group_reader.metadata()->ColumnChunk(col_index),
-                row_group_reader.GetColumnPageReader(col_index));
+            return makeLeafReader<DataTypeDecimal<DateTime64>>(row_group_reader, std::move(read_type));
         }
         case parquet::Type::FLOAT:
             return makeLeafReader<DataTypeFloat32>(row_group_reader);
@@ -426,6 +415,34 @@ public:
     const std::vector<int> & usedColIndice() { return parquet_col_indice; }
 
 private:
+    struct VisitContext
+    {
+        std::string field_path;
+        Int16 def_level;
+        std::vector<Int16> lists_def_levels;
+
+        void appendChild(const parquet::schema::NodePtr node)
+        {
+            if (node->is_repeated())
+            {
+                def_level++;
+                lists_def_levels.push_back(new_def_level);
+            }
+            else if (node->is_optional())
+            {
+                def_level++;
+            }
+            field_path += ("." + node->name());
+        }
+
+        VisitContext copyWithChild(const parquet::schema::NodePtr node)
+        {
+            auto copy = *this;
+            copy.appendChild(node);
+            return copy;
+        }
+    };
+
     const parquet::SchemaDescriptor * schema;
     const Block & header;
     const FormatSettings & format_settings;
@@ -434,13 +451,13 @@ private:
     std::vector<int> parquet_col_indice;
 
     ParquetColReaderFactoryPtr makeColReaderFactory(
-        const parquet::schema::NodePtr node, DataTypePtr ch_type, std::string field_path);
+        const parquet::schema::NodePtr node, DataTypePtr ch_type, VisitContext & context);
     ParquetColReaderFactoryPtr makeFactoryFromGroup(
-        const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, std::string field_path);
+        const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, VisitContext & context);
     ParquetColReaderFactoryPtr makeFactoryFromList(
-        const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, std::string field_path);
+        const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, VisitContext & context);
     ParquetColReaderFactoryPtr makeFactoryFromMap(
-        const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, std::string field_path);
+        const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, VisitContext & context);
 };
 
 ParquetColReaderFactories ParquetSchemaParser::makeColReaderFactories()
@@ -456,29 +473,30 @@ ParquetColReaderFactories ParquetSchemaParser::makeColReaderFactories()
             // TODO null as default
             throw Exception(ErrorCodes::PARQUET_EXCEPTION, "no column with '{}' in parquet file", col_with_name.name);
         }
+        VisitContext context{col_with_name.name, 0, {}};
         auto factory = makeColReaderFactory(
-            schema->group_node()->field(field_idx), col_with_name.type, col_with_name.name);
+            schema->group_node()->field(field_idx), col_with_name.type, context);
         ret.emplace_back(std::move(factory));
     }
     return ret;
 }
 
 ParquetColReaderFactoryPtr ParquetSchemaParser::makeColReaderFactory(
-    const parquet::schema::NodePtr node, DataTypePtr ch_type, std::string field_path)
+    const parquet::schema::NodePtr node, DataTypePtr ch_type, VisitContext & context)
 {
     if (node->is_group())
     {
         if (node->logical_type()->is_list()) {
-            return makeFactoryFromList(static_cast<const parquet::schema::GroupNode &>(*node), ch_type, field_path);
+            return makeFactoryFromList(static_cast<const parquet::schema::GroupNode &>(*node), ch_type, context);
         } else if (node->logical_type()->is_map()) {
-            return makeFactoryFromMap(static_cast<const parquet::schema::GroupNode &>(*node), ch_type, field_path);
+            return makeFactoryFromMap(static_cast<const parquet::schema::GroupNode &>(*node), ch_type, context);
         }
         // std::shared_ptr<ArrowType> type;
         if (node->is_repeated()) {
         }
         else
         {
-            return makeFactoryFromGroup(static_cast<const parquet::schema::GroupNode &>(*node), ch_type, field_path);
+            return makeFactoryFromGroup(static_cast<const parquet::schema::GroupNode &>(*node), ch_type, context);
         }
     }
     else
@@ -490,23 +508,25 @@ ParquetColReaderFactoryPtr ParquetSchemaParser::makeColReaderFactory(
             col_idx,
             arrow_properties,
             *schema->Column(col_idx),
-            ch_type);
+            ch_type,
+            context.lists_def_levels);
     }
     return nullptr;
 }
 
 ParquetColReaderFactoryPtr ParquetSchemaParser::makeFactoryFromGroup(
-    const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, std::string field_path)
+    const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, VisitContext & context)
 {
     const auto ch_tuple_type = typeid_cast<DataTypeTuplePtr>(ch_type);
     if (!ch_tuple_type)
     {
-        throw Exception(
-            ErrorCodes::PARQUET_EXCEPTION, "can not read group field {} to {}", field_path, ch_type->getFamilyName());
+        constexpr auto msg = "can not read group field {} to {}";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path, ch_type->getFamilyName());
     }
     if (!ch_tuple_type->haveExplicitNames())
     {
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, "only explicit names supported for tuple field {}", field_path);
+        constexpr auto msg = "only explicit names supported for tuple field {}";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
     }
 
     ParquetColReaderFactories factories;
@@ -514,75 +534,103 @@ ParquetColReaderFactoryPtr ParquetSchemaParser::makeFactoryFromGroup(
     for (size_t i = 0; i < ch_tuple_type->getElements().size(); i++)
     {
         const auto & field_name = ch_tuple_type->getElementNames()[i];
-        auto sub_field_path = field_path + "." + field_name;
         auto field_idx = gnode_helper.fieldIndex(field_name);
         if (field_idx < 0)
         {
             // TODO null as default
-            throw Exception(ErrorCodes::PARQUET_EXCEPTION, "column path {} not found", sub_field_path);
+            throw Exception(ErrorCodes::PARQUET_EXCEPTION, "column path {} not found", sub_context.field_path);
         }
-        factories.emplace_back(makeColReaderFactory(
-            group_node.field(field_idx), ch_tuple_type->getElement(i), sub_field_path));
+        auto childNode = group_node.field(field_idx);
+        auto sub_context = context.copyWithChild(childNode);
+        factories.emplace_back(makeColReaderFactory(childNode, ch_tuple_type->getElement(i), sub_context));
     }
     return std::make_unique<TupleColReaderFactory>(std::move(factories), std::move(ch_tuple_type));
 }
 
 ParquetColReaderFactoryPtr ParquetSchemaParser::makeFactoryFromList(
-    const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, std::string field_path)
+    const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, VisitContext & context)
 {
     if (group_node.field_count() != 1)
     {
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, "LIST-annotated group {} must have a single child.", field_path);
+        constexpr auto msg = "LIST-annotated group {} must have a single child.";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
     }
     if (group_node.is_repeated())
     {
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, "LIST-annotated group {} must not be repeated.", field_path);
+        constexpr auto msg = "LIST-annotated group {} must not be repeated.";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
     }
-    const auto ch_array_type = typeid_cast<const DataTypeArray *>(ch_type.get());
+    const auto ch_array_type = typeid_cast<DataTypeArrayPtr>(ch_type);
     if (!ch_array_type)
     {
-        throw Exception(
-            ErrorCodes::PARQUET_EXCEPTION, "can not read list field {} to {}", field_path, ch_type->getFamilyName());
+        constexpr auto msg = "can not read list field {} to {}";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path, ch_type->getFamilyName());
     }
-    return nullptr;
+
+    const parquet::schema::NodePtr list_node = group_node.field(0);
+    if (!list_node->is_repeated())
+    {
+        constexpr auto msg = "Non-repeated node {} in a LIST-annotated group are not supported.";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
+    }
+    context.appendChild(list_node);
+
+    if (list_node->is_group())
+    {
+        // Resolve 3-level encoding, which normally looks like: {group_node}.list[repeated].element
+        const auto & list_group = static_cast<const parquet::schema::GroupNode &>(*list_node);
+        if (list_group.field_count() == 1 && !hasStructListName(list_group.name()))
+        {
+            context.appendChild(list_group.field(0));
+            auto nested_factory = makeColReaderFactory(group_node.field(0), ch_array_type->getNestedType(), context);
+            return std::make_unique<ArrayColReaderFactory>(nested_factory, ch_array_type);
+        }
+        else
+        {
+            auto nested_factory = makeFactoryFromGroup(list_group, ch_array_type->getNestedType(), context);
+            return std::make_unique<ArrayColReaderFactory>(nested_factory, ch_array_type);
+        }
+    }
 }
 
 ParquetColReaderFactoryPtr ParquetSchemaParser::makeFactoryFromMap(
-    const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, std::string field_path)
+    const parquet::schema::GroupNode & group_node, DataTypePtr ch_type, VisitContext & context)
 {
     if (group_node.field_count() != 1)
     {
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, "MAP-annotated group {} must have a single child.", field_path);
+        constexpr auto msg = "MAP-annotated group {} must have a single child.";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
     }
     if (group_node.is_repeated())
     {
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, "MAP-annotated group {} must not be repeated.", field_path);
+        constexpr auto msg = "MAP-annotated group {} must not be repeated.";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
     }
 
     const auto & kv_node = *group_node.field(0);
 
     if (!kv_node.is_repeated())
     {
-        static constexpr auto msg = "Non-repeated key value in a MAP-annotated group {} are not supported.";
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, field_path);
+        constexpr auto msg = "Non-repeated key value in a MAP-annotated group {} are not supported.";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
     }
 
     if (!kv_node.is_group())
     {
-        static constexpr auto msg = "Key-value node must be a group in a MAP-annotated group {}.";
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, field_path);
+        constexpr auto msg = "Key-value node must be a group in a MAP-annotated group {}.";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path);
     }
 
     const auto & kv_group_node = static_cast<const parquet::schema::GroupNode &>(kv_node);
     if (kv_group_node.field_count() != 1 && kv_group_node.field_count() != 2)
     {
-        static constexpr auto msg = "Key-value map node must have 1 or 2 child elements in a MAP-annotated group {}. Found {}";
-        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, field_path, kv_group_node.field_count());
+        constexpr auto msg = "Key-value map node must have 1 or 2 child elements in a MAP-annotated group {}. Found {}";
+        throw Exception(ErrorCodes::PARQUET_EXCEPTION, msg, context.field_path, kv_group_node.field_count());
     }
 
     if (kv_group_node.field_count() == 1)
     {
-        return makeFactoryFromGroup(group_node, ch_type, field_path);
+        return makeFactoryFromGroup(group_node, ch_type, context);
     }
     return nullptr;
 }
@@ -634,7 +682,7 @@ Chunk ParquetRecordReader::readChunk()
     for (size_t i = 0; i < header.columns(); i++)
     {
         columns[i] = castColumn(
-            column_readers[i]->readBatch(num_rows_read, header.getByPosition(i).name),
+            column_readers[i]->readBatch(num_rows_read, header.getByPosition(i).name).detailed_column,
             header.getByPosition(i).type);
     }
     left_rows -= num_rows_read;

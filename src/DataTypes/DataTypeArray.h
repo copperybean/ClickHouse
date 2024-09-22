@@ -75,4 +75,6 @@ public:
     size_t getNumberOfDimensions() const;
 };
 
+using DataTypeArrayPtr = std::shared_ptr<const DataTypeArray>;
+
 }

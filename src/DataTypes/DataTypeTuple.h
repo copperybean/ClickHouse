@@ -74,5 +74,7 @@ public:
     void forEachChild(const ChildCallback & callback) const override;
 };
 
+using DataTypeTuplePtr = std::shared_ptr<DataTypeTuple>;
+
 }
 
