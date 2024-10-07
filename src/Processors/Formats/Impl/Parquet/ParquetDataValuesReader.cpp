@@ -16,7 +16,7 @@ namespace ErrorCodes
 
 RleValuesReader::RleValuesReader(
     std::unique_ptr<arrow::bit_util::BitReader> bit_reader_, Int32 bit_width_)
-    : bit_reader(std::move(bit_reader_)), bit_width(bit_width_)
+    : bit_reader(std::move(bit_reader_)), bit_width(bit_width_), byte_width((bit_width + 7) / 8)
 {
     if (unlikely(bit_width >= 64))
     {
@@ -45,7 +45,7 @@ void RleValuesReader::nextGroup()
     else
     {
         cur_value = 0;
-        read_res = bit_reader->GetAligned((bit_width + 7) / 8, &cur_value);
+        read_res = bit_reader->GetAligned(byte_width, &cur_value);
         assert(read_res);
     }
     cur_group_cursor = 0;
@@ -179,6 +179,58 @@ void RleValuesReader::visitNullableBySteps(
     }
 }
 
+template <typename IndividualNullVisitor, typename RepeatedNullVisitor>
+void RleValuesReader::visitNullableBySteps(
+    size_t cursor,
+    UInt32 num_values,
+    Int32 max_def_level,
+    PaddedPODArray<UInt32> & valid_idx_steps,
+    IndividualNullVisitor && individual_null_visitor,
+    RepeatedNullVisitor && repeated_null_visitor)
+{
+    UInt32 step_idx = 0;
+    valid_idx_steps.resize(num_values);
+    valid_idx_steps[step_idx] = 0;
+    while (num_values > 0)
+    {
+        nextGroupIfNecessary();
+        auto cur_count = std::min(num_values, curGroupLeft());
+
+        if (cur_group_is_packed)
+        {
+            auto null_map_cursor = cursor;
+            for (auto i = cur_group_cursor; i < cur_group_cursor + cur_count; i++)
+            {
+                if (cur_packed_bit_values[i] == max_def_level)
+                {
+                    valid_idx_steps[++step_idx] = 1;
+                }
+                else
+                {
+                    individual_null_visitor(null_map_cursor);
+                    valid_idx_steps[step_idx]++;
+                }
+                null_map_cursor++;
+            }
+        }
+        else if (cur_value == max_def_level)
+        {
+            for (UInt32 i = 0; i < cur_count; i++)
+                valid_idx_steps[++step_idx] = 1;
+        }
+        else
+        {
+            repeated_null_visitor(cursor, cur_count);
+            valid_idx_steps[step_idx] += cur_count;
+        }
+
+        cursor += cur_count;
+        cur_group_cursor += cur_count;
+        num_values -= cur_count;
+    }
+    valid_idx_steps.resize(step_idx + 1);
+}
+
 template <typename TValue, typename ValueGetter>
 void RleValuesReader::setValues(TValue * res_values, UInt32 num_values, ValueGetter && val_getter)
 {
@@ -218,6 +270,34 @@ void RleValuesReader::setValueBySteps(
             for (UInt32 i = 0; i < count; i++)
             {
                 *res_values = getted_val;
+                res_values += *(step_iterator++);
+            }
+        }
+    );
+}
+
+template <typename TValue, typename ValueGetter>
+void RleValuesReader::setValueBySteps(
+    TValue * res_values,
+    const PaddedPODArray<UInt32> & col_data_steps,
+    ValueGetter && val_getter)
+{
+    auto step_iterator = col_data_steps.begin();
+    res_values += *(step_iterator++);
+
+    visitValues(
+        static_cast<UInt32>(col_data_steps.size() - 1),
+        /* individual_visitor */ [&](Int32 val)
+        {
+            *res_values = val_getter(val);
+            res_values += *(step_iterator++);
+        },
+        /* repeated_visitor */ [&](UInt32 count, Int32 val)
+        {
+            auto got_val = val_getter(val);
+            for (UInt32 i = 0; i < count; i++)
+            {
+                *res_values = got_val;
                 res_values += *(step_iterator++);
             }
         }
@@ -523,31 +603,24 @@ void ParquetRleDictReader<TColumnVector>::readBatch(
     auto * column_data = getResizedPrimitiveData(*assert_cast<TColumnVector *>(col_ptr.get()), cursor + num_values);
     const auto & dictionary_array = static_cast<const TColumnVector &>(page_dictionary).getData();
 
-    auto val_getter = [&](Int32 val) { return dictionary_array[val]; };
+    PaddedPODArray<UInt32> valid_index_steps;
     def_level_reader->visitNullableBySteps(
         cursor,
         num_values,
         max_def_level,
+        valid_index_steps,
         /* individual_null_visitor */ [&](size_t nest_cursor)
         {
             null_map.setNull(nest_cursor);
         },
-        /* stepped_valid_visitor */ [&](size_t nest_cursor, const std::vector<UInt8> & valid_index_steps)
+        /* repeated_null_visitor */ [&](size_t nest_cursor, UInt32 count)
         {
-            rle_data_reader->setValueBySteps(column_data + nest_cursor, valid_index_steps, val_getter);
-        },
-        /* repeated_visitor */ [&](bool is_valid, size_t nest_cursor, UInt32 count)
-        {
-            if (is_valid)
-            {
-                rle_data_reader->setValues(column_data + nest_cursor, count, val_getter);
-            }
-            else
-            {
-                null_map.setNull(nest_cursor, count);
-            }
+            null_map.setNull(nest_cursor, count);
         }
     );
+
+    auto val_getter = [&](Int32 val) { return dictionary_array[val]; };
+    rle_data_reader->setValueBySteps(column_data + cursor, valid_index_steps, val_getter);
 }
 
 

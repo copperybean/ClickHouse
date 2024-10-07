@@ -24,7 +24,8 @@ public:
      * @brief Used when the bit_width is 0, so all elements have same value.
      */
     explicit RleValuesReader(UInt32 total_size, Int32 val = 0)
-        : bit_reader(nullptr), bit_width(0), cur_group_size(total_size), cur_value(val), cur_group_is_packed(false)
+        : bit_reader(nullptr), bit_width(0), byte_width(0)
+        , cur_group_size(total_size), cur_value(val), cur_group_is_packed(false)
         {}
 
     void nextGroup();
@@ -93,6 +94,15 @@ public:
         SteppedValidVisitor && stepped_valid_visitor,
         RepeatedVisitor && repeated_visitor);
 
+    template <typename IndividualNullVisitor, typename RepeatedNullVisitor>
+    void visitNullableBySteps(
+        size_t cursor,
+        UInt32 num_values,
+        Int32 max_def_level,
+        PaddedPODArray<UInt32> & valid_idx_steps,
+        IndividualNullVisitor && individual_null_visitor,
+        RepeatedNullVisitor && repeated_null_visitor);
+
     /**
      * @brief Set the Values to column_data directly
      *
@@ -113,6 +123,12 @@ public:
         const std::vector<UInt8> & col_data_steps,
         ValueGetter && val_getter);
 
+    template <typename TValue, typename ValueGetter>
+    void setValueBySteps(
+        TValue * res_values,
+        const PaddedPODArray<UInt32> & col_data_steps,
+        ValueGetter && val_getter);
+
 private:
     std::unique_ptr<arrow::bit_util::BitReader> bit_reader;
 
@@ -120,6 +136,7 @@ private:
     std::vector<UInt8> valid_index_steps;
 
     const Int32 bit_width;
+    const Int32 byte_width;
 
     UInt32 cur_group_size = 0;
     UInt32 cur_group_cursor = 0;
