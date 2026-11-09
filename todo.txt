@@ -1,0 +1,8 @@
+
+repeated值如果跨了page，要不要支持
+
+tuple 类型如果有嵌套array，需要优化顶层offsets生成逻辑
+
+d-nullable-2.parquet文件，arrow里e列的def levels在BitReader里也有16个值吗？
+
+visitValuesConditionally里如何处理越界，因为必须越界才知道当前list读完了
